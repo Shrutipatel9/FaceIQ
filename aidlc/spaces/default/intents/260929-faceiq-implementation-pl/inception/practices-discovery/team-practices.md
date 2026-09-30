@@ -1,0 +1,178 @@
+# Team Practices — FaceIQ (AI Facial Analysis Platform)
+
+## Way of Working
+
+- We keep both applications in one repository (`https://github.com/Shrutipatel9/FaceIQ`): a Python/FastAPI backend in `backend/` and a Next.js/TypeScript frontend in `frontend/`. Each has its own toolchain, README and CI job, and they talk over HTTP/CORS ([Client-stated] `NFR-001`, `NFR-005`). An API change and the frontend code that uses it ship in the same pull request.
+- We use trunk-based development. All work reaches `main` through short-lived feature branches that are resolved within 1-2 days. We have no long-lived `develop` or `release/*` branches.
+- Every change reaches `main` through a pull request. CI must be green and one reviewer must approve. Nobody pushes directly to `main`, and `main` is branch-protected with the CI checks as required status checks.
+- We squash-merge. Each pull request (and each Construction Bolt) becomes one commit on `main`, named by the Bolt slug. Construction worktrees use base branch `main` and merge target `main`.
+- Pull-request and commit titles cite the `client_requirements.md` requirement IDs they implement (for example `AUTH-012`, `FR-015`). A change to the client document can then be traced to the affected code ([Client-stated] `client_requirements.md` §12).
+- We hide incomplete features that are merged to `main` behind configuration flags. We do not keep them on long-lived branches.
+- We treat `client_requirements.md` as the single source of truth. Anything the client did not state stays labelled `[Recommendation]`, `[Assumption]` or `[Decided by delivery team]`, and we raise conflicts with the human instead of resolving them silently.
+
+## Walking Skeleton
+
+- Yes. When Construction starts, the first thing we build is a thin end-to-end slice. It is the **email + password login step** running through the full required auth layering: `UI → Zustand Auth Store → API Client → Backend Auth APIs → JWT/OTP Services` ([Client-stated] `client_requirements.md` §5.3, `AUTH-003`, `FE-001`–`FE-007`).
+- The slice proves the following pieces connect before feature work begins:
+  - the two-app split and CORS with credentials (`NFR-001`, `NFR-005`)
+  - PostgreSQL through SQLAlchemy, with the first Alembic migration (`NFR-002`–`NFR-004`)
+  - the single Zustand auth store and centralized API client
+  - backend token and OTP services kept separate from route handlers
+- This planning intent (`requirements-to-plan`) skips Construction, so no skeleton ceremony runs here. This practice governs the future Construction intent.
+- The skeleton's verification command is chosen and authorized by the human when Construction is scoped. It runs locally with one documented command and assumes no hosting provider (`NFR-010`, `CON-007`).
+
+## Testing Posture
+
+- **Methodology**: custom
+- **Ordering**: Tests are written before implementation for the exactly-specified rules (auth token rotation, reuse detection and OTP lockout, the payment gate HTTP 402, the photo identity-check vote and HTTP 409 recheck, and recommendation tiering), and after implementation, layer by layer, for everything else.
+- Tests are a deliverable in every change. Every `FR-*`, `AUTH-*` and `BR-*` requirement maps to at least one test case ([Client-stated] `client_requirements.md` §12).
+- **Requirement traceability:**
+  - Tests are tagged with requirement IDs: a pytest marker `@pytest.mark.req("AUTH-012")` in the backend, and the ID in the `describe`/`it` title or Playwright test title in the frontend.
+  - A CI script compares the tags with the IDs in `client_requirements.md` and fails on any unmapped `FR-*`, `AUTH-*` or `BR-*` ID.
+  - IDs still waiting on a detailed specification, and IDs that cannot be tested by automation (for example `BR-006`, `BR-007`), sit on a reviewed pending list with a reason.
+  - Tests never assert content the client marked unconfirmed (Face Shape and the Skin view in `FR-018`, the Protocol section in `FR-017`).
+- **Coverage floors**, blocking merge in CI:
+  - 80% line and 80% branch coverage per application.
+  - 90% line and branch coverage for the backend auth services, the payment-gate code and the identity-check code, and for the frontend auth store and API client.
+  - Exclusions live only in a reviewed list in config (Alembic migration scripts, generated OpenAPI types, framework config files) and change only by pull request. We never weaken a floor or add an exclusion to make a check pass.
+- **Backend tooling:**
+  - `pytest`, `pytest-cov` (`--cov-branch`), and FastAPI `TestClient` / `httpx` for API tests.
+  - A real PostgreSQL (CI service container) with `alembic upgrade head` applied. Each test runs in a rolled-back transaction.
+  - An injectable clock for every time rule: OTP expiry, cooldown and lockout; access, refresh and `reset_token` lifetimes (`AUTH-011`, `AUTH-012`, `AUTH-015`).
+  - Test-data factories for users, OTP records, sessions and payments.
+- **Migrations:** a round-trip test (`upgrade head` → `downgrade base` → `upgrade head`) proves every Alembic migration is reversible (`NFR-003`).
+- **Frontend tooling:**
+  - Vitest with React Testing Library.
+  - Mock Service Worker with fake timers for the API client: proactive refresh, 401 → refresh → retry, single-flight refresh, and the `FE-006` cases where auth must not be cleared.
+  - A test that the auth store writes nothing to `localStorage` or `sessionStorage` (`FE-002`).
+  - Playwright for end-to-end journeys (`WF-001`, `WF-002`).
+- **Contract between the apps:** frontend API types are generated from the backend's OpenAPI schema. CI fails when the committed generated types drift from the schema.
+- **External services are never called live in per-push/PR tests.** Each sits behind its interface with a fake:
+  - **Email OTP** (`NFR-012`): a fake provider captures messages in unit and integration tests. End-to-end tests read the OTP from a local SMTP catcher (for example Mailpit), not from a test-only endpoint in the application.
+  - **Stripe** (`NFR-009`, `FR-015`, `FR-016`):
+    - Webhook tests use payloads signed with a test secret. They cover invalid signatures, duplicate and out-of-order events, and they assert that the webhook never starts analysis.
+    - Price and currency come from configuration.
+    - End-to-end tests stub session creation and post a signed fixture webhook.
+  - **OpenAI narrative and chat** (`FR-008`, `FR-019`, `NFR-008`), tested in layers:
+    - Deterministic unit tests on the prompt builder cover `FR-008` (a), (b), (e) and (f).
+    - A structured-output schema is validated at runtime and in tests: all 11 features, 3–5 sentences each, measurement cited.
+    - Integration tests replay recorded responses with secrets scrubbed.
+    - Evaluation against the real model is a separate, opt-in suite. It is never a per-PR gate.
+  - **Image generation** (`FR-020`, `FR-022`, `NFR-013`):
+    - A fake adapter returns fixed images. Tests assert 24 images per report and the healthy-aging card rules.
+    - One shared contract suite runs against every adapter behind the image-generation abstraction.
+    - Visual quality (`ASM-011`) is a manual review, not an automated gate.
+- **Computer vision** (`FR-006`, `FR-007`, `FR-018`, `ASM-010`):
+  - Measurement, assessment and identity-signature logic takes landmark coordinates as input. It is tested on landmark-coordinate fixtures, not face photos.
+  - The identity vote has exhaustive table tests over all 8 pairwise match patterns (`BR-005`).
+  - Image fixtures are limited to the thin MediaPipe/OpenCV adapter and the per-photo checks. They are licensed or consented images only, kept outside the public repository where required.
+  - We never use real user photos.
+  - The MediaPipe version and Face Landmarker model file are pinned. Thresholds are read from configuration, not duplicated in tests.
+  - Threshold calibration is a separate evaluation activity, not a CI gate.
+- **Security and abuse tests** are part of the `AUTH-*` / `BR-*` mapping, not optional:
+  - 402 and 409 bypass attempts
+  - refresh-token reuse
+  - a `reset_token` presented as Bearer
+  - CSRF header and origin checks
+  - OTP lockout
+  - object-level authorization (user A cannot read user B's records)
+  - invalid or replayed Stripe signatures
+  - hostile uploads (non-image, polyglot, oversize, decompression bomb)
+- A flaky test is quarantined with a tracking issue and fixed or removed within one week. A quarantined test does not count toward requirement mapping.
+
+## Deployment
+
+- We do not deploy anywhere for now. We build and push to GitHub.
+- GitHub Actions runs the automated checks on every push and pull request, and a failing check blocks the merge. There are no deployment jobs. The checks are:
+  - format and lint, including security lint
+  - type-check
+  - backend unit and integration tests against PostgreSQL
+  - frontend unit tests
+  - Playwright smoke journeys with all vendors faked
+  - the OpenAPI drift check
+  - the migration round-trip
+  - coverage floors and the requirement-traceability check
+  - security scans
+- **Security scans** are blocking on High/Critical findings:
+  - Gitleaks for secrets: blocking on any finding, in CI and pre-commit.
+  - Semgrep or CodeQL for code scanning.
+  - `pip-audit` and `pnpm audit` for dependency CVEs, with Dependabot alerts and update PRs.
+  - A waiver is kept in the repository with a justification, an owner and an expiry date. An expired waiver fails the build again.
+- **CI supply chain:**
+  - Lockfiles are committed and CI installs from them exactly.
+  - Third-party Actions are pinned to a full commit SHA.
+  - Workflow `permissions:` default to `contents: read`.
+  - No secrets are exposed to pull-request runs from forks.
+- Hosting is not decided and is never assumed, including Replit or any other host ([Client-stated] `NFR-010`, `CON-007`). Deployment targets, environments, packaging format, SBOM publication, container scanning and DAST are decided when a host is chosen.
+- Both applications stay host-neutral. Every environment-specific value comes from environment variables or a secrets manager through one typed settings object per app. Each app commits a `.env.example` with placeholders only. The values are:
+  - database URL
+  - OpenAI base URL, key and model; image vendor
+  - Stripe keys; email provider
+  - price and currency
+  - CORS origins
+  - photo-angle set
+  - token and OTP lifetimes
+- Database changes ship only as Alembic migrations, following expand-contract (`NFR-003`). When deployment is introduced, every deployment must carry a documented rollback path and a post-deploy smoke check (Operation phase guardrails).
+
+## Code Style
+
+- We follow the formatter and linter configs committed in the repository. They run in pre-commit hooks and in CI, and a failure blocks the merge. Naming is language-idiomatic.
+- **Backend (Python):**
+  - Ruff for both linting and formatting, with the `S` (flake8-bandit) and `B` (bugbear) rule sets enabled, configured in `backend/pyproject.toml`.
+  - mypy `strict` on `backend/app/`, with type hints on every function.
+  - OTP and token generation use `secrets`, never `random`.
+  - SQL uses bound parameters only.
+- **Frontend (TypeScript):**
+  - TypeScript `strict` with `noUncheckedIndexedAccess`; `tsc --noEmit` in CI.
+  - ESLint (Next.js config plus `eslint-plugin-security` and `eslint-plugin-no-unsanitized`, with `react/no-danger` as an error) and Prettier.
+  - pnpm, with exactly one committed lockfile.
+  - A check fails any `NEXT_PUBLIC_*` variable whose name looks like a secret. The Stripe publishable key is allow-listed.
+- **Folder layout.**
+  - `backend/app/`:
+    - `main.py`: app factory, CORS, exception handlers
+    - `core/`: settings, logging, errors, security primitives
+    - `api/routes/`: thin handlers, one module per resource
+    - `api/deps.py`
+    - `schemas/`: Pydantic request/response models
+    - `services/`: business rules
+    - `repositories/`: the only place that builds SQLAlchemy queries
+    - `models/`: ORM
+    - `integrations/`: the only place that imports vendor SDKs — `llm/`, `image_gen/`, `payments/`, `email/`
+    - `cv/`: pure MediaPipe/OpenCV logic
+  - `backend/tests/` mirrors `app/`.
+  - `frontend/src/`:
+    - `app/`: routes
+    - `components/`: presentational UI, with `ui/` for shared primitives such as the toast and confirmation dialog
+    - `features/<feature>/`
+    - `stores/auth-store.ts`: the only auth store
+    - `lib/api/client.ts`: the only place that performs HTTP
+    - `lib/api/<resource>.ts`: typed endpoint functions
+    - `types/`: including the generated API types
+  - The repository root holds `docs/adr/` and `.github/workflows/`.
+- **Layer boundaries, enforced by linters rather than prose:**
+  - Backend direction is `routes → services → (repositories | integrations | cv) → models`. Lower layers never import higher ones. Services never import `fastapi`. Token, OTP, payment-gate and identity-check logic lives in services, never in route handlers ([Client-stated] §5.3 for JWT/OTP). `import-linter` contracts enforce this in CI.
+  - Frontend: UI components, features and pages never call auth APIs, never touch tokens and never call `fetch` directly. They use auth-store actions and the API client ([Client-stated] `FE-003`, `FE-004`, `FE-007`). ESLint `no-restricted-imports` and `no-restricted-syntax` enforce this, and the auth store may not import Zustand `persist` (`FE-002`).
+  - Because the access token lives only in memory, protected routes are guarded on the client side and wait for the auth store's initializing flag. No Next.js route handler or middleware proxies auth traffic.
+- **Vendor integrations** (OpenAI text, OpenAI image, Stripe, email) sit behind small `typing.Protocol` interfaces, and a factory selects the implementation from configuration ([Client-stated] `NFR-008`, `NFR-013`). Every vendor call has an explicit timeout.
+- **Error handling:**
+  - The backend has one domain-error hierarchy in `app/core/errors.py`: a base `AppError` with a stable `code` and a safe `message`. Errors map to HTTP status only in the exception handlers registered in `main.py`:
+    - authentication → 401
+    - permission → 403
+    - payment required → 402
+    - identity mismatch → 409, with the mismatched angles
+    - validation → 422, with a per-photo reason
+  - Every non-2xx response uses one JSON envelope: `{"error": {"code", "message", "details"}}`. Responses never include stack traces.
+  - Vendor exceptions are wrapped in `IntegrationError` subclasses. Transient failures (timeouts, 429, 5xx) retry with bounded backoff; auth and validation failures fail fast.
+  - Unexpected exceptions are logged once, at the handler, with a request ID. Sensitive values are never logged.
+  - In the frontend, the API client turns every failure into one typed `ApiError { status, code, message, details }`. The toast layer maps `code` to user copy (`BR-009`). Components never use empty `catch {}` blocks.
+- **Naming conventions:**
+  - Python: `snake_case` modules and functions, `PascalCase` classes, `*_service.py` / `*_repository.py`, Pydantic `XxxRequest` / `XxxResponse`, singular ORM models with plural `snake_case` tables. Alembic revision messages are imperative and cite the `DATA-*` ID.
+  - TypeScript: `PascalCase.tsx` components, other files in `kebab-case.ts`, hooks `useXxx` (the store hook is `useAuthStore`), `PascalCase` types with no `I` prefix.
+  - API paths: lower-case, with plural resources.
+- **Documentation for the client's AI-assisted continuation** ([Client-stated] `BC-005`, `NFR-011`):
+  - a README per application covering setup, run, test and configuration keys
+  - a root README explaining how the two apps fit together
+  - an agent-instructions file per app stating the layering, where code goes, the error convention and the test commands
+  - docstrings / TSDoc on public modules, services and API handlers
+  - ADRs in `docs/adr/` with Context, Decision, Consequences and Alternatives Rejected
+- We prefer explicit code: no metaprogramming or dynamic imports beyond the configuration-selected vendor factory, and small, single-purpose modules.
